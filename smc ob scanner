@@ -1,0 +1,357 @@
+//@version=6
+// SMC Order Block 掃描器 v5 — 單週期 × 40 檔，單一 alert
+//
+// 結構與 OB 判定邏輯對齊 LuxAlgo "Smart Money Concepts"（CC BY-NC-SA 4.0）之演算法：
+//   swing 狀態機、ATR/CMR 波動濾網、區間極值 K 取 OB、close/high-low mitigation。
+// 「價格進入 OB」的觸發判定為本腳本自行追加，非原指標行為。
+// 僅供研究用途，請遵守原作者的非商業授權條款。
+indicator("SMC OB Screener v5", overlay = false, max_bars_back = 500)
+
+G_SCAN = "① 掃描"
+G_SYM  = "② 代號清單"
+G_DISP = "③ 顯示"
+G_ADV  = "④ 進階（對齊 LuxAlgo，非必要勿動）"
+
+// ═══════════════ ① 掃描 ═══════════════
+tf = input.timeframe("60", "掃描週期", group = G_SCAN,
+     tooltip = "一份腳本只掃一個週期。要同時看 60 和 120，就把這支腳本加到圖表兩次，各設一個週期，各建一個 alert。")
+
+nearPct = input.float(2.0, "「快摸到」門檻(%)", minval = 0.1, step = 0.5, group = G_SCAN,
+     tooltip = "距離 OB 在這個百分比以內的標的會標色，但不會發警報。警報只在真正進入區間時發。")
+
+// ═══════════════ ② 代號清單 ═══════════════
+symTxt = input.text_area(
+     "TWSE:2330\nTWSE:2317\nTWSE:2454\nTWSE:2382\nTWSE:2308\nTWSE:3231\nTWSE:2303\nTWSE:3037\nTWSE:2368\nTPEX:6488",
+     "代號（每行一檔，上限 40）", group = G_SYM,
+     tooltip = "格式：交易所:代號，例如 TWSE:2330（上市）、TPEX:6488（上櫃）。\n一行一檔；逗號、空格分隔也可以。\n超過 40 檔的部分會被忽略（Pine 的 request.security 上限）。")
+
+// ═══════════════ ③ 顯示 ═══════════════
+showRows = input.int(20, "顯示前幾名", minval = 5, maxval = 40, group = G_DISP)
+txtSize  = input.string("normal", "字級", options = ["small", "normal", "large", "huge"], group = G_DISP)
+tblPos   = input.string("正中", "表格位置", options = ["正中", "中上", "中下", "右上", "右下", "左上", "左下"], group = G_DISP)
+
+// ═══════════════ ④ 進階 ═══════════════
+obSet    = input.string("Internal", "結構層級", options = ["Internal", "Swing"], group = G_ADV)
+swingLen = input.int(50, "Swing 長度",    minval = 10, group = G_ADV)
+intLen   = input.int(5,  "Internal 長度", minval = 2,  group = G_ADV)
+obFilter = input.string("Atr", "OB 波動濾網", options = ["Atr", "Cumulative Mean Range"], group = G_ADV)
+mitigate = input.string("High/Low", "Mitigation 方式", options = ["Close", "High/Low"], group = G_ADV)
+obKeep   = input.int(5, "保留 OB 數", minval = 1, maxval = 20, group = G_ADV)
+maxScan  = input.int(300, "OB 掃描回溯上限(根)", minval = 20, group = G_ADV,
+     tooltip = "跑不動時先把這個降到 100。")
+
+f_size() =>
+    switch txtSize
+        "small"  => size.small
+        "normal" => size.normal
+        "large"  => size.large
+        => size.huge
+
+f_pos() =>
+    switch tblPos
+        "中上" => position.top_center
+        "中下" => position.bottom_center
+        "右上" => position.top_right
+        "右下" => position.bottom_right
+        "左上" => position.top_left
+        "左下" => position.bottom_left
+        => position.middle_center
+
+// ── 配色 ──
+C_HEAD     = #1f2933
+C_HEADTXT  = #c9d3df
+C_LINE     = #2c3846
+C_ROW_A    = #161b22
+C_ROW_B    = #1b2028
+C_SYMTXT   = #7d8996
+C_DIM      = #5a6572
+C_BULL_HIT = #0f7a52
+C_BEAR_HIT = #9e2b3a
+C_BULL_NEAR= #12312a
+C_BEAR_NEAR= #33181e
+C_BULL_TXT = #4ad9a0
+C_BEAR_TXT = #ff7b8a
+C_ROW_HIT  = #2a3340
+C_DOUBLE   = #8a5a0f
+
+// ═══════════════ 全域函式 ═══════════════
+// LuxAlgo 的 swing 狀態機：os 翻轉時把 len 根前的極值登記為 swing 點
+f_swings(len) =>
+    var int os = 0
+    upper = ta.highest(len)
+    lower = ta.lowest(len)
+    os := high[len] > upper ? 0 : low[len] < lower ? 1 : os[1]
+    top = os == 0 and os[1] != 0 ? high[len] : 0.0
+    btm = os == 1 and os[1] != 1 ? low[len]  : 0.0
+    [top, btm]
+
+// 區間內取極值 K 作為 OB（先過波動濾網）
+// useMax = true  → 取最高 high 那根（空方 OB）
+// useMax = false → 取最低 low  那根（多方 OB）
+f_obCoord(useMax, loc, thrVal, scanCap) =>
+    float mn  = 1e20
+    float mx  = 0.
+    bool  hit = false
+    lim = math.min(bar_index - loc - 1, scanCap)
+    for i = 1 to math.max(lim, 1)
+        if (high[i] - low[i]) < thrVal * 2
+            if useMax
+                if high[i] > mx
+                    mx  := high[i]
+                    mn  := low[i]
+                    hit := true
+            else
+                if low[i] < mn
+                    mn  := low[i]
+                    mx  := high[i]
+                    hit := true
+    [hit, mx, mn]
+
+f_push(useMax, loc, obDir, thrVal, scanCap, cap, aTop, aBtm, aType) =>
+    [hit, mx, mn] = f_obCoord(useMax, loc, thrVal, scanCap)
+    bool ok = false
+    if hit
+        array.unshift(aTop,  mx)
+        array.unshift(aBtm,  mn)
+        array.unshift(aType, obDir)
+        ok := true
+        // 只保留最新 cap 個（不分方向），對齊 LuxAlgo 只畫最近 N 個的行為
+        if array.size(aType) > cap
+            array.pop(aTop)
+            array.pop(aBtm)
+            array.pop(aType)
+    ok
+
+// ═══════════════ 掃描主函式 ═══════════════
+obScan() =>
+    // ── 波動門檻 ──
+    atrv = ta.atr(200)
+    cmr  = ta.cum(high - low) / math.max(bar_index, 1)
+    thr  = obFilter == "Atr" ? atrv : cmr
+
+    // ── 結構狀態 ──
+    var int   trend     = 0
+    var int   itrend    = 0
+    var float topY      = 0.
+    var int   topX      = 0
+    var float btmY      = 0.
+    var int   btmX      = 0
+    var float itopY     = 0.
+    var int   itopX     = 0
+    var float ibtmY     = 0.
+    var int   ibtmX     = 0
+    var bool  topCross  = true
+    var bool  btmCross  = true
+    var bool  itopCross = true
+    var bool  ibtmCross = true
+
+    // ── OB 儲存 ──
+    var array<float> obTop  = array.new<float>()
+    var array<float> obBtm  = array.new<float>()
+    var array<int>   obType = array.new<int>()   // 1 = 多方, -1 = 空方
+
+    [top, btm]   = f_swings(swingLen)
+    [itop, ibtm] = f_swings(intLen)
+
+    if top != 0
+        topCross := true
+        topY     := top
+        topX     := bar_index - swingLen
+    if btm != 0
+        btmCross := true
+        btmY     := btm
+        btmX     := bar_index - swingLen
+    if itop != 0
+        itopCross := true
+        itopY     := itop
+        itopX     := bar_index - intLen
+    if ibtm != 0
+        ibtmCross := true
+        ibtmY     := ibtm
+        ibtmX     := bar_index - intLen
+
+    bool createdBull = false
+    bool createdBear = false
+
+    wantInternal = obSet == "Internal"
+
+    // ── 多方結構破壞 ──
+    if ta.crossover(close, itopY) and itopCross and topY != itopY
+        itopCross := false
+        itrend    := 1
+        if wantInternal
+            createdBull := f_push(false, itopX, 1, thr, maxScan, obKeep, obTop, obBtm, obType)
+
+    if ta.crossover(close, topY) and topCross
+        topCross := false
+        trend    := 1
+        if not wantInternal
+            createdBull := f_push(false, topX, 1, thr, maxScan, obKeep, obTop, obBtm, obType)
+
+    // ── 空方結構破壞 ──
+    if ta.crossunder(close, ibtmY) and ibtmCross and btmY != ibtmY
+        ibtmCross := false
+        itrend    := -1
+        if wantInternal
+            createdBear := f_push(true, ibtmX, -1, thr, maxScan, obKeep, obTop, obBtm, obType)
+
+    if ta.crossunder(close, btmY) and btmCross
+        btmCross := false
+        trend    := -1
+        if not wantInternal
+            createdBear := f_push(true, btmX, -1, thr, maxScan, obKeep, obTop, obBtm, obType)
+
+    // ── Mitigation ──
+    if array.size(obType) > 0
+        for k = array.size(obType) - 1 to 0
+            t  = array.get(obType, k)
+            tp = array.get(obTop, k)
+            bt = array.get(obBtm, k)
+            bool dead = false
+            if mitigate == "Close"
+                dead := t == 1 ? close < bt : close > tp
+            else
+                dead := t == 1 ? low < bt : high > tp
+            if dead
+                array.remove(obTop,  k)
+                array.remove(obBtm,  k)
+                array.remove(obType, k)
+
+    // ── 最近的未失效 OB + 是否進入 ──
+    float nbTop = na
+    float nbBtm = na
+    float nsTop = na
+    float nsBtm = na
+    bool  inBull = false
+    bool  inBear = false
+
+    if array.size(obType) > 0
+        for k = 0 to array.size(obType) - 1
+            t  = array.get(obType, k)
+            tp = array.get(obTop, k)
+            bt = array.get(obBtm, k)
+            isIn = low <= tp and high >= bt
+            if t == 1
+                inBull := inBull or isIn
+                if na(nbTop) or math.abs(close - tp) < math.abs(close - nbTop)
+                    nbTop := tp
+                    nbBtm := bt
+            else
+                inBear := inBear or isIn
+                if na(nsBtm) or math.abs(close - bt) < math.abs(close - nsBtm)
+                    nsTop := tp
+                    nsBtm := bt
+
+    // 邊緣觸發：只在「從外面進來」的那一根發訊；OB 成立當根不算
+    var bool wasBull = false
+    var bool wasBear = false
+    newBull = inBull and not wasBull and not createdBull
+    newBear = inBear and not wasBear and not createdBear
+    wasBull := inBull
+    wasBear := inBear
+
+    // 距離：正值 = 尚未到達，還差幾 %
+    nbDist = na(nbTop) ? na : (close - nbTop) / close * 100
+    nsDist = na(nsBtm) ? na : (nsBtm - close) / close * 100
+
+    [newBull, newBear, inBull, inBear, nbTop, nbBtm, nbDist, nsTop, nsBtm, nsDist]
+
+// ═══════════════ 呈現層 ═══════════════
+// 每格回傳：顯示文字、底色、文字色、排序用距離(觸碰=0)、是否觸碰
+f_cell(inBull, inBear, nbTop, nbBtm, nbDist, nsTop, nsBtm, nsDist) =>
+    string txt  = "–"
+    color  bg   = na
+    color  fg   = C_DIM
+    float  dist = 1e9
+    bool   hit  = false
+
+    if inBull
+        txt  := "多 " + str.tostring(nbBtm, format.mintick) + "–" + str.tostring(nbTop, format.mintick)
+        bg   := C_BULL_HIT
+        fg   := color.white
+        dist := 0.
+        hit  := true
+    else if inBear
+        txt  := "空 " + str.tostring(nsBtm, format.mintick) + "–" + str.tostring(nsTop, format.mintick)
+        bg   := C_BEAR_HIT
+        fg   := color.white
+        dist := 0.
+        hit  := true
+    else
+        bullNear = not na(nbDist) and nbDist >= 0
+        bearNear = not na(nsDist) and nsDist >= 0
+        if bullNear and (not bearNear or nbDist <= nsDist)
+            dist := nbDist
+            txt  := "多 ▼" + str.tostring(nbDist, "#.0") + "%  " + str.tostring(nbTop, format.mintick)
+            bg   := nbDist <= nearPct ? C_BULL_NEAR : na
+            fg   := nbDist <= nearPct ? C_BULL_TXT : C_DIM
+        else if bearNear
+            dist := nsDist
+            txt  := "空 ▲" + str.tostring(nsDist, "#.0") + "%  " + str.tostring(nsBtm, format.mintick)
+            bg   := nsDist <= nearPct ? C_BEAR_NEAR : na
+            fg   := nsDist <= nearPct ? C_BEAR_TXT : C_DIM
+    [txt, bg, fg, dist, hit]
+
+// ═══════════════ 主體 ═══════════════
+rawSym  = str.replace_all(str.replace_all(str.replace_all(symTxt, "\r", ","), "\n", ","), " ", ",")
+allSyms = str.split(rawSym, ",")
+syms    = array.new<string>()
+if array.size(allSyms) > 0
+    for k = 0 to array.size(allSyms) - 1
+        v = array.get(allSyms, k)
+        if str.length(v) > 0 and array.size(syms) < 40
+            array.push(syms, v)
+n = array.size(syms)
+
+colSym   = array.new<string>()
+colTxt   = array.new<string>()
+colBg    = array.new<color>()
+colFg    = array.new<color>()
+colHit   = array.new<bool>()
+colScore = array.new<float>()
+msg      = ""
+
+for i = 0 to n - 1
+    sym = array.get(syms, i)
+    [nBull, nBear, iBull, iBear, bTop, bBtm, bDist, sTop, sBtm, sDist] = request.security(sym, tf, obScan())
+    [txt, bg, fg, dist, hit] = f_cell(iBull, iBear, bTop, bBtm, bDist, sTop, sBtm, sDist)
+
+    array.push(colSym,   sym)
+    array.push(colTxt,   txt)
+    array.push(colBg,    bg)
+    array.push(colFg,    fg)
+    array.push(colHit,   hit)
+    // 排序鍵：觸碰 < 快摸到 < 其他（升冪）
+    array.push(colScore, hit ? -1000. : dist)
+
+    if nBull
+        msg := msg + sym + " [" + tf + "] 進入多方OB " + str.tostring(bBtm, format.mintick) + "~" + str.tostring(bTop, format.mintick) + "\n"
+    if nBear
+        msg := msg + sym + " [" + tf + "] 進入空方OB " + str.tostring(sBtm, format.mintick) + "~" + str.tostring(sTop, format.mintick) + "\n"
+
+// ═══════════════ 表格 ═══════════════
+var table t = table.new(f_pos(), 2, 41, border_width = 0, frame_width = 1,
+     frame_color = C_LINE, border_color = C_LINE)
+
+if barstate.islast and n > 0
+    table.clear(t, 0, 0, 1, 40)
+    order = array.sort_indices(colScore, order.ascending)
+    rows  = math.min(n, showRows)
+
+    table.cell(t, 0, 0, "代號", bgcolor = C_HEAD, text_color = C_HEADTXT, text_size = f_size(), text_halign = text.align_left)
+    table.cell(t, 1, 0, tf + "m", bgcolor = C_HEAD, text_color = C_HEADTXT, text_size = f_size())
+
+    for r = 0 to rows - 1
+        i    = array.get(order, r)
+        hit  = array.get(colHit, i)
+        rowBg = hit ? C_ROW_HIT : (r % 2 == 0 ? C_ROW_A : C_ROW_B)
+
+        table.cell(t, 0, r + 1, array.get(colSym, i), bgcolor = rowBg,
+             text_color = hit ? color.white : C_SYMTXT, text_size = f_size(), text_halign = text.align_left)
+        table.cell(t, 1, r + 1, array.get(colTxt, i),
+             bgcolor = na(array.get(colBg, i)) ? rowBg : array.get(colBg, i),
+             text_color = array.get(colFg, i), text_size = f_size())
+
+// ═══════════════ 單一 alert ═══════════════
+if barstate.isconfirmed and str.length(msg) > 0
+    alert(msg, alert.freq_once_per_bar_close)
