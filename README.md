@@ -18,3 +18,4 @@
 <img width="1228" height="494" alt="image" src="https://github.com/user-attachments/assets/093ea810-0efb-4041-a657-5a5b56416f8b" />
 6.代號這裡就輸入你要的標的的代號就能掃描了，時間週期也是在這裡調
 <img width="1906" height="910" alt="image" src="https://github.com/user-attachments/assets/26c271a6-4236-415b-8577-72936d43871e" />
+7.claude修改過的smc也是相同用法，要用LuxAlgo的也可以，但是基於Luxalgo開發的沒辦法做到相同的ob區間所以最好還是用修改過的
