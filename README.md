@@ -1,4 +1,4 @@
-事先聲明:這是基於LuxAlgo 的程式碼改建的scanner，全是calude寫的，我完全不會代碼，出bug最好去找ai
+事先聲明:這是基於LuxAlgo 的程式碼改建的scanner，全是claude寫的，我完全不會代碼，出bug最好去找ai
 
 哥們是窮鬼沒錢買tradingview會員所以這邊的腳本要自己輸入
 使用方法(電腦版優先行動板沒研究過):
