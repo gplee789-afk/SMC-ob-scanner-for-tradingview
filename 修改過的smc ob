@@ -1,0 +1,172 @@
+//@version=6
+// SMC OB Debug v4 — 依 LuxAlgo 原始碼逐段移植
+//
+// 演算法來源：Smart Money Concepts [LuxAlgo]，CC BY-NC-SA 4.0。
+// 本檔僅為比對用途的移植重寫，非原始碼複製；請遵守原作者非商業授權條款。
+//
+// v3 → v4 的修正：
+//   1. 波動濾網改為「對調 high/low」而非跳過（parsedHigh / parsedLow）
+//   2. 極值搜尋區間改為含 pivot 當根：slice(pivotBarIndex, bar_index)
+//   3. OB 陣列保留 100 個，只顯示最新 5 個未失效的（原本砍到 5，舊的永久丟失）
+//   4. CMR 改用 ta.cum(ta.tr) / bar_index
+//   5. 內部結構長度固定 5，與原始碼一致
+indicator("SMC OB Debug v4", overlay = true, max_bars_back = 500,
+     max_boxes_count = 60, max_labels_count = 500)
+
+// ═══════════════ 參數 ═══════════════
+useInternal = input.bool(true,  "使用 Internal 結構（取消則用 Swing）")
+swingLen    = input.int(50, "Swing 長度", minval = 10)
+obFilter    = input.string("Atr", "OB 波動濾網", options = ["Atr", "Cumulative Mean Range"])
+mitigate    = input.string("High/Low", "Mitigation 方式", options = ["Close", "High/Low"])
+obShow      = input.int(5, "顯示 OB 數", minval = 1, maxval = 20)
+ifilter     = input.bool(false, "Confluence Filter")
+showBrk     = input.bool(true,  "標記結構破壞")
+
+INT_LEN = 5   // 原始碼寫死
+
+C_BULL = color.new(#3179f5, 80)
+C_BEAR = color.new(#f77c80, 80)
+
+// ═══════════════ 型別 ═══════════════
+type pivot
+    float currentLevel = na
+    bool  crossed      = false
+    int   barIndex     = 0
+
+type ob
+    float barHigh = na
+    float barLow  = na
+    int   barIdx  = 0
+    int   bias    = 0
+
+var pivot internalHigh = pivot.new()
+var pivot internalLow  = pivot.new()
+var pivot swingHigh    = pivot.new()
+var pivot swingLow     = pivot.new()
+var int   internalBias = 0
+var int   swingBias    = 0
+
+var array<float> parsedHighs = array.new<float>()
+var array<float> parsedLows  = array.new<float>()
+var array<ob>    orderBlocks = array.new<ob>()
+var array<box>   obBoxes     = array.new<box>()
+var array<label> obLabels    = array.new<label>()
+
+if barstate.isfirst
+    for i = 1 to obShow
+        array.push(obBoxes, box.new(na, na, na, na, extend = extend.right))
+        array.push(obLabels, label.new(na, na, "", style = label.style_label_left,
+             color = color.new(color.black, 100), textcolor = color.white, size = size.small))
+
+// ═══════════════ 每根：波動濾網（對調而非跳過）═══════════════
+atrMeasure        = ta.atr(200)
+volatilityMeasure = obFilter == "Atr" ? atrMeasure : ta.cum(ta.tr) / math.max(bar_index, 1)
+highVolatilityBar = (high - low) >= (2 * volatilityMeasure)
+parsedHigh        = highVolatilityBar ? low  : high
+parsedLow         = highVolatilityBar ? high : low
+
+array.push(parsedHighs, parsedHigh)
+array.push(parsedLows,  parsedLow)
+
+// ═══════════════ leg / pivot 偵測 ═══════════════
+f_leg(size) =>
+    var int lg = 0
+    newLegHigh = high[size] > ta.highest(size)
+    newLegLow  = low[size]  < ta.lowest(size)
+    if newLegHigh
+        lg := 0          // BEARISH_LEG
+    else if newLegLow
+        lg := 1          // BULLISH_LEG
+    lg
+
+// 更新 pivot 物件（物件為參考型別，函式內修改會保留）
+f_updateStructure(int size, pivot pHigh, pivot pLow) =>
+    lg  = f_leg(size)
+    chg = ta.change(lg)
+    if chg == +1                       // 轉多 → 登記 pivot low
+        pLow.currentLevel := low[size]
+        pLow.crossed      := false
+        pLow.barIndex     := bar_index - size
+    else if chg == -1                  // 轉空 → 登記 pivot high
+        pHigh.currentLevel := high[size]
+        pHigh.crossed      := false
+        pHigh.barIndex     := bar_index - size
+
+f_updateStructure(swingLen, swingHigh, swingLow)
+f_updateStructure(INT_LEN,  internalHigh, internalLow)
+
+// ═══════════════ 取 OB 座標（含 pivot 當根）═══════════════
+f_storeOB(pivot p, int bias, array<float> pHighs, array<float> pLows, array<ob> obs) =>
+    if p.barIndex < bar_index and p.barIndex >= 0
+        int idx = na
+        if bias == -1
+            a = array.slice(pHighs, p.barIndex, bar_index)
+            idx := p.barIndex + array.indexof(a, array.max(a))
+        else
+            a = array.slice(pLows, p.barIndex, bar_index)
+            idx := p.barIndex + array.indexof(a, array.min(a))
+        array.unshift(obs, ob.new(array.get(pHighs, idx), array.get(pLows, idx), idx, bias))
+        if array.size(obs) > 100
+            array.pop(obs)
+
+// ═══════════════ 結構破壞 ═══════════════
+bullishBar = ifilter ? (high - math.max(close, open) > math.min(close, open - low)) : true
+bearishBar = ifilter ? (high - math.max(close, open) < math.min(close, open - low)) : true
+
+pHi  = useInternal ? internalHigh : swingHigh
+pLo  = useInternal ? internalLow  : swingLow
+extraUp = useInternal ? (internalHigh.currentLevel != swingHigh.currentLevel and bullishBar) : true
+extraDn = useInternal ? (internalLow.currentLevel  != swingLow.currentLevel  and bearishBar) : true
+
+if ta.crossover(close, pHi.currentLevel) and not pHi.crossed and extraUp
+    pHi.crossed := true
+    if useInternal
+        internalBias := 1
+    else
+        swingBias := 1
+    f_storeOB(pHi, 1, parsedHighs, parsedLows, orderBlocks)
+    if showBrk
+        label.new(bar_index, low, "▲", style = label.style_label_up,
+             color = color.new(color.black, 100), textcolor = #089981, size = size.tiny)
+
+if ta.crossunder(close, pLo.currentLevel) and not pLo.crossed and extraDn
+    pLo.crossed := true
+    if useInternal
+        internalBias := -1
+    else
+        swingBias := -1
+    f_storeOB(pLo, -1, parsedHighs, parsedLows, orderBlocks)
+    if showBrk
+        label.new(bar_index, high, "▼", style = label.style_label_down,
+             color = color.new(color.black, 100), textcolor = #F23645, size = size.tiny)
+
+// ═══════════════ Mitigation ═══════════════
+bearSrc = mitigate == "Close" ? close : high
+bullSrc = mitigate == "Close" ? close : low
+
+if array.size(orderBlocks) > 0
+    for k = array.size(orderBlocks) - 1 to 0
+        o = array.get(orderBlocks, k)
+        if (o.bias == -1 and bearSrc > o.barHigh) or (o.bias == 1 and bullSrc < o.barLow)
+            array.remove(orderBlocks, k)
+
+// ═══════════════ 畫框（只畫最新 obShow 個）═══════════════
+if barstate.islastconfirmedhistory or barstate.islast
+    n = array.size(orderBlocks)
+    for i = 0 to obShow - 1
+        b = array.get(obBoxes, i)
+        l = array.get(obLabels, i)
+        if i < n
+            o = array.get(orderBlocks, i)
+            box.set_lefttop(b, o.barIdx, o.barHigh)
+            box.set_rightbottom(b, bar_index, o.barLow)
+            box.set_bgcolor(b, o.bias == 1 ? C_BULL : C_BEAR)
+            box.set_border_color(b, na)
+            label.set_xy(l, bar_index, o.barHigh)
+            label.set_text(l, (o.bias == 1 ? "多 " : "空 ") +
+                 str.tostring(o.barLow, format.mintick) + "–" + str.tostring(o.barHigh, format.mintick))
+            label.set_textcolor(l, o.bias == 1 ? #3179f5 : #f77c80)
+        else
+            box.set_lefttop(b, na, na)
+            box.set_rightbottom(b, na, na)
+            label.set_text(l, "")
